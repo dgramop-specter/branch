@@ -47,6 +47,25 @@ enum Commands {
     },
     /// Print the directory containing branch.toml
     Root,
+    /// Generate Nix flake URLs for a sibling repo
+    Nix {
+        #[command(subcommand)]
+        nix_command: NixCommands,
+    },
+}
+
+#[derive(Subcommand)]
+enum NixCommands {
+    /// Generate a remote git+ssh Nix URL for the repo
+    Remote {
+        /// Name of the sibling repo
+        repo: String,
+    },
+    /// Generate a local git+file Nix URL for the repo
+    Local {
+        /// Name of the sibling repo
+        repo: String,
+    },
 }
 
 fn main() -> Result<()> {
@@ -64,6 +83,10 @@ fn main() -> Result<()> {
             dry_run,
         }) => cmd_migrate(&trees_path, dry_run),
         Some(Commands::Root) => cmd_root(),
+        Some(Commands::Nix { nix_command }) => match nix_command {
+            NixCommands::Remote { repo } => cmd_nix_remote(&repo),
+            NixCommands::Local { repo } => cmd_nix_local(&repo),
+        },
         None => cmd_show_branch(),
     }
 }
@@ -491,6 +514,93 @@ fn find_branch_dirs(
     Ok(())
 }
 
+/// Generate a remote git+ssh Nix URL for a sibling repo
+fn cmd_nix_remote(repo: &str) -> Result<()> {
+    let toml_path =
+        find_branch_toml().context("No branch.toml found in current or parent directories")?;
+    let config = read_branch_config(&toml_path)?;
+    let branch_name = &config.branch;
+    let branch_dir = toml_path.parent().unwrap();
+
+    // Find the sibling repo
+    let repo_path = branch_dir.join(repo);
+    if !repo_path.exists() {
+        bail!("Repo '{}' not found at {}", repo, repo_path.display());
+    }
+
+    // Get the remote origin URL
+    let output = Command::new("git")
+        .args(["remote", "get-url", "origin"])
+        .current_dir(&repo_path)
+        .output()
+        .context("Failed to run git remote get-url")?;
+
+    if !output.status.success() {
+        bail!("Failed to get remote URL for {}", repo);
+    }
+
+    let remote_url = String::from_utf8_lossy(&output.stdout).trim().to_string();
+
+    // Convert git@github.com:owner/repo.git to git+ssh://git@github.com/owner/repo
+    let nix_url = convert_to_nix_ssh_url(&remote_url, branch_name)?;
+    print!("{}", nix_url);
+
+    Ok(())
+}
+
+/// Convert a git remote URL to a Nix git+ssh URL
+fn convert_to_nix_ssh_url(remote_url: &str, branch: &str) -> Result<String> {
+    // Handle git@github.com:owner/repo.git format
+    if let Some(rest) = remote_url.strip_prefix("git@github.com:") {
+        let repo_path = rest.strip_suffix(".git").unwrap_or(rest);
+        return Ok(format!(
+            "git+ssh://git@github.com/{}?ref={}",
+            repo_path, branch
+        ));
+    }
+
+    // Handle ssh://git@github.com/owner/repo.git format
+    if let Some(rest) = remote_url.strip_prefix("ssh://git@github.com/") {
+        let repo_path = rest.strip_suffix(".git").unwrap_or(rest);
+        return Ok(format!(
+            "git+ssh://git@github.com/{}?ref={}",
+            repo_path, branch
+        ));
+    }
+
+    // Handle https://github.com/owner/repo.git format
+    if let Some(rest) = remote_url.strip_prefix("https://github.com/") {
+        let repo_path = rest.strip_suffix(".git").unwrap_or(rest);
+        return Ok(format!(
+            "git+ssh://git@github.com/{}?ref={}",
+            repo_path, branch
+        ));
+    }
+
+    bail!("Unsupported remote URL format: {}", remote_url);
+}
+
+/// Generate a local git+file Nix URL for a sibling repo
+fn cmd_nix_local(repo: &str) -> Result<()> {
+    let toml_path =
+        find_branch_toml().context("No branch.toml found in current or parent directories")?;
+    let branch_dir = toml_path.parent().unwrap();
+
+    // Find the sibling repo
+    let repo_path = branch_dir.join(repo);
+    if !repo_path.exists() {
+        bail!("Repo '{}' not found at {}", repo, repo_path.display());
+    }
+
+    let canonical_path = repo_path
+        .canonicalize()
+        .with_context(|| format!("Failed to resolve path: {}", repo_path.display()))?;
+
+    print!("git+file://{}", canonical_path.display());
+
+    Ok(())
+}
+
 /// Print the directory containing branch.toml
 fn cmd_root() -> Result<()> {
     match find_branch_toml() {
@@ -531,6 +641,8 @@ fn print_usage() {
     eprintln!("    branch migrate <trees_path>         Migrate existing structure to branch.toml");
     eprintln!("    branch migrate --dry-run <path>     Preview migration without changes");
     eprintln!("    branch root                         Print directory containing branch.toml");
+    eprintln!("    branch nix remote <repo>            Generate git+ssh Nix URL for repo");
+    eprintln!("    branch nix local <repo>             Generate git+file Nix URL for repo");
     eprintln!();
     eprintln!("Run 'branch --help' for more information.");
 }

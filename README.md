@@ -82,6 +82,29 @@ branch root
 
 Returns the directory containing `branch.toml`. Useful for scripts that need to reference sibling repos.
 
+### Generate Nix flake URLs
+
+Generate Nix-compatible URLs for sibling repos, useful for flake inputs:
+
+```bash
+cd ~/trees/dhruv/make_repo_better/some-repo
+
+# Remote URL (for CI/sharing)
+branch nix remote branch
+# Output: git+ssh://git@github.com/dgramop-specter/branch?ref=dhruv/make_repo_better
+
+# Local URL (for development)
+branch nix local branch
+# Output: git+file:///home/user/trees/dhruv/make_repo_better/branch
+```
+
+Use in a flake.nix:
+```nix
+{
+  inputs.my-dep.url = "git+ssh://git@github.com/owner/repo?ref=dhruv/make_repo_better";
+}
+```
+
 ### Migrate existing structure
 
 If you already have a trees-like directory structure without `branch.toml` files:
@@ -102,6 +125,8 @@ The migration detects git repositories (by the presence of `.git`) and creates `
 | `branch clone <ns> <repo>` | Clone repo as a worktree |
 | `branch clone --deep <ns> <repo>` | Clone repo fully (for submodules) |
 | `branch root` | Print directory containing `branch.toml` |
+| `branch nix remote <repo>` | Generate `git+ssh://` Nix URL for sibling repo |
+| `branch nix local <repo>` | Generate `git+file://` Nix URL for sibling repo |
 | `branch migrate <path>` | Add `branch.toml` to existing structure |
 | `branch migrate --dry-run <path>` | Preview migration |
 | `branch -h` | Show help |
