@@ -45,6 +45,8 @@ enum Commands {
         #[arg(long)]
         dry_run: bool,
     },
+    /// Print the directory containing branch.toml
+    Root,
 }
 
 fn main() -> Result<()> {
@@ -61,6 +63,7 @@ fn main() -> Result<()> {
             trees_path,
             dry_run,
         }) => cmd_migrate(&trees_path, dry_run),
+        Some(Commands::Root) => cmd_root(),
         None => cmd_show_branch(),
     }
 }
@@ -488,6 +491,20 @@ fn find_branch_dirs(
     Ok(())
 }
 
+/// Print the directory containing branch.toml
+fn cmd_root() -> Result<()> {
+    match find_branch_toml() {
+        Some(toml_path) => {
+            let root_dir = toml_path.parent().unwrap();
+            print!("{}", root_dir.display());
+            Ok(())
+        }
+        None => {
+            bail!("No branch.toml found in current or parent directories");
+        }
+    }
+}
+
 /// Show the current branch (when no subcommand given)
 fn cmd_show_branch() -> Result<()> {
     match find_branch_toml() {
@@ -513,6 +530,7 @@ fn print_usage() {
     eprintln!("    branch clone --deep <ns> <repo>     Clone repo fully (for submodules)");
     eprintln!("    branch migrate <trees_path>         Migrate existing structure to branch.toml");
     eprintln!("    branch migrate --dry-run <path>     Preview migration without changes");
+    eprintln!("    branch root                         Print directory containing branch.toml");
     eprintln!();
     eprintln!("Run 'branch --help' for more information.");
 }

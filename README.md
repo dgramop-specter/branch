@@ -72,6 +72,16 @@ Traverses up to find `branch.toml` and prints the branch name.
 
 Useful for command output injection in editors like vim or helix, in my use case for pointing flake pins to my branch
 
+### Get branch root directory
+
+```bash
+cd ~/trees/dhruv/make_repo_better/branch/src
+branch root
+# Output: /home/user/trees/dhruv/make_repo_better
+```
+
+Returns the directory containing `branch.toml`. Useful for scripts that need to reference sibling repos.
+
 ### Migrate existing structure
 
 If you already have a trees-like directory structure without `branch.toml` files:
@@ -91,6 +101,7 @@ The migration detects git repositories (by the presence of `.git`) and creates `
 | `branch new <name>` | Create a new branch directory with `branch.toml` |
 | `branch clone <ns> <repo>` | Clone repo as a worktree |
 | `branch clone --deep <ns> <repo>` | Clone repo fully (for submodules) |
+| `branch root` | Print directory containing `branch.toml` |
 | `branch migrate <path>` | Add `branch.toml` to existing structure |
 | `branch migrate --dry-run <path>` | Preview migration |
 | `branch -h` | Show help |
