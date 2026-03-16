@@ -37,6 +37,14 @@ enum Commands {
         #[arg(long)]
         deep: bool,
     },
+    /// Migrate an existing trees directory structure to use branch.toml
+    Migrate {
+        /// Path to the trees directory to migrate
+        trees_path: PathBuf,
+        /// Show what would be done without making changes
+        #[arg(long)]
+        dry_run: bool,
+    },
 }
 
 fn main() -> Result<()> {
@@ -49,6 +57,10 @@ fn main() -> Result<()> {
             repo,
             deep,
         }) => cmd_clone(&namespace, &repo, deep),
+        Some(Commands::Migrate {
+            trees_path,
+            dry_run,
+        }) => cmd_migrate(&trees_path, dry_run),
         None => cmd_show_branch(),
     }
 }
@@ -377,6 +389,105 @@ fn do_deep_clone(source_repo_path: &Path, target_dir: &Path, branch_name: &str) 
     Ok(())
 }
 
+/// Migrate an existing trees directory structure to use branch.toml
+fn cmd_migrate(trees_path: &Path, dry_run: bool) -> Result<()> {
+    let trees_path = trees_path
+        .canonicalize()
+        .with_context(|| format!("Failed to resolve path: {}", trees_path.display()))?;
+
+    if !trees_path.is_dir() {
+        bail!("Not a directory: {}", trees_path.display());
+    }
+
+    if dry_run {
+        println!("Dry run - no changes will be made\n");
+    }
+
+    let mut found_branches = Vec::new();
+    find_branch_dirs(&trees_path, &trees_path, &mut found_branches)?;
+
+    if found_branches.is_empty() {
+        println!("No git repositories found under {}", trees_path.display());
+        return Ok(());
+    }
+
+    for (branch_dir, branch_name) in &found_branches {
+        let toml_path = branch_dir.join("branch.toml");
+
+        if toml_path.exists() {
+            println!("[skip] {} (branch.toml already exists)", branch_name);
+            continue;
+        }
+
+        if dry_run {
+            println!("[would create] {} -> {}", branch_name, toml_path.display());
+        } else {
+            let config = BranchConfig {
+                branch: branch_name.clone(),
+            };
+            let toml_content =
+                toml::to_string_pretty(&config).context("Failed to serialize config")?;
+            fs::write(&toml_path, toml_content)
+                .with_context(|| format!("Failed to write {}", toml_path.display()))?;
+            println!("[created] {} -> {}", branch_name, toml_path.display());
+        }
+    }
+
+    Ok(())
+}
+
+/// Recursively find directories that should have branch.toml
+/// A branch directory is the parent of a directory containing .git
+fn find_branch_dirs(
+    base_path: &Path,
+    current_path: &Path,
+    results: &mut Vec<(PathBuf, String)>,
+) -> Result<()> {
+    let entries = fs::read_dir(current_path)
+        .with_context(|| format!("Failed to read directory: {}", current_path.display()))?;
+
+    for entry in entries {
+        let entry = entry?;
+        let path = entry.path();
+
+        if !path.is_dir() {
+            continue;
+        }
+
+        let name = entry.file_name();
+        // Skip hidden directories
+        if name.to_string_lossy().starts_with('.') {
+            continue;
+        }
+
+        // Check if this directory contains a .git (worktree or full clone)
+        let git_path = path.join(".git");
+        if git_path.exists() {
+            // This is a repo - the branch name is the path from base to parent
+            let branch_dir = current_path;
+            let branch_name = branch_dir
+                .strip_prefix(base_path)
+                .unwrap_or(branch_dir.as_ref())
+                .to_string_lossy()
+                .to_string();
+
+            // Only add if we haven't already added this branch dir
+            if !results.iter().any(|(dir, _)| dir == branch_dir) {
+                if branch_name.is_empty() {
+                    // Repo is directly in trees_path, skip
+                    continue;
+                }
+                results.push((branch_dir.to_path_buf(), branch_name));
+            }
+        } else {
+            // Recurse into subdirectory
+            find_branch_dirs(base_path, &path, results)?;
+        }
+    }
+
+    Ok(())
+}
+
 /// Show the current branch (when no subcommand given)
 fn cmd_show_branch() -> Result<()> {
     match find_branch_toml() {
@@ -396,10 +507,12 @@ fn print_usage() {
     eprintln!("branch - A utility for managing git worktrees across multiple repos");
     eprintln!();
     eprintln!("USAGE:");
-    eprintln!("    branch                          Show current branch (from branch.toml)");
-    eprintln!("    branch new <branch_name>        Create a new branch directory");
-    eprintln!("    branch clone <ns> <repo>        Clone repo as worktree");
-    eprintln!("    branch clone --deep <ns> <repo> Clone repo fully (for submodules)");
+    eprintln!("    branch                              Show current branch (from branch.toml)");
+    eprintln!("    branch new <branch_name>            Create a new branch directory");
+    eprintln!("    branch clone <ns> <repo>            Clone repo as worktree");
+    eprintln!("    branch clone --deep <ns> <repo>     Clone repo fully (for submodules)");
+    eprintln!("    branch migrate <trees_path>         Migrate existing structure to branch.toml");
+    eprintln!("    branch migrate --dry-run <path>     Preview migration without changes");
     eprintln!();
     eprintln!("Run 'branch --help' for more information.");
 }
