@@ -299,8 +299,8 @@ fn do_worktree(source_repo_path: &Path, target_dir: &Path, branch_name: &str) ->
             .args([
                 "worktree",
                 "add",
-                "-b",
                 "--guess-remote",
+                "-b",
                 branch_name,
                 target_dir.to_str().unwrap(),
                 // &format!("origin/{}", default_branch),
