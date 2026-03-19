@@ -274,35 +274,36 @@ fn do_worktree(source_repo_path: &Path, target_dir: &Path, branch_name: &str) ->
     } else {
         // Branch doesn't exist, create new branch from default branch
         // First, find the default branch
-        let output = Command::new("git")
-            .args(["symbolic-ref", "refs/remotes/origin/HEAD"])
-            .current_dir(source_repo_path)
-            .output()
-            .context("Failed to get default branch")?;
+        // let output = Command::new("git")
+        //     .args(["symbolic-ref", "refs/remotes/origin/HEAD"])
+        //     .current_dir(source_repo_path)
+        //     .output()
+        //     .context("Failed to get default branch")?;
 
-        let default_branch = if output.status.success() {
-            String::from_utf8_lossy(&output.stdout)
-                .trim()
-                .strip_prefix("refs/remotes/origin/")
-                .unwrap_or("master")
-                .to_string()
-        } else {
-            "master".to_string()
-        };
+        // let default_branch = if output.status.success() {
+        //     String::from_utf8_lossy(&output.stdout)
+        //         .trim()
+        //         .strip_prefix("refs/remotes/origin/")
+        //         .unwrap_or("master")
+        //         .to_string()
+        // } else {
+        //     "master".to_string()
+        // };
 
-        println!(
-            "Branch '{}' doesn't exist, creating from '{}'...",
-            branch_name, default_branch
-        );
+        // println!(
+        //     "Branch '{}' doesn't exist, creating from '{}'...",
+        //     branch_name, default_branch
+        // );
 
         let status = Command::new("git")
             .args([
                 "worktree",
                 "add",
                 "-b",
+                "--guess-remote",
                 branch_name,
                 target_dir.to_str().unwrap(),
-                &format!("origin/{}", default_branch),
+                // &format!("origin/{}", default_branch),
             ])
             .current_dir(source_repo_path)
             .status()
