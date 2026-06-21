@@ -13,7 +13,7 @@ struct BranchConfig {
 
 #[derive(Parser)]
 #[command(name = "branch")]
-#[command(about = "A utility for managing git worktrees across multiple repos")]
+#[command(about = "A utility for managing jj workspaces across multiple repos")]
 #[command(version)]
 struct Cli {
     #[command(subcommand)]
@@ -27,13 +27,13 @@ enum Commands {
         /// Branch name (slashes become subdirectories)
         branch_name: String,
     },
-    /// Clone a repo as a worktree (or full clone with --deep)
+    /// Clone a repo as a jj workspace (or full clone with --deep)
     Clone {
         /// GitHub namespace (e.g., "anthropics")
         namespace: String,
         /// GitHub repo name (e.g., "claude-code")
         repo: String,
-        /// Do a full clone instead of a worktree
+        /// Do a full clone instead of a workspace
         #[arg(long)]
         deep: bool,
     },
@@ -137,7 +137,7 @@ fn cmd_new(branch_name: &str) -> Result<()> {
     Ok(())
 }
 
-/// Clone a repo as a worktree or full clone
+/// Clone a repo as a workspace or full clone
 fn cmd_clone(namespace: &str, repo: &str, deep: bool) -> Result<()> {
     // Find branch.toml
     let toml_path = find_branch_toml().context(
@@ -168,8 +168,8 @@ fn cmd_clone(namespace: &str, repo: &str, deep: bool) -> Result<()> {
         // Full clone
         do_deep_clone(&source_repo_path, &target_dir, branch_name)?;
     } else {
-        // Worktree
-        do_worktree(&source_repo_path, &target_dir, branch_name)?;
+        // jj workspace
+        do_workspace(&source_repo_path, &target_dir, branch_name)?;
     }
 
     println!("Cloned {} to {}", repo, target_dir.display());
@@ -178,18 +178,118 @@ fn cmd_clone(namespace: &str, repo: &str, deep: bool) -> Result<()> {
     Ok(())
 }
 
+/// Get the origin remote URL from a jj repo
+fn get_remote_url(repo_path: &Path) -> Result<String> {
+    let output = Command::new("jj")
+        .args(["git", "remote", "list"])
+        .current_dir(repo_path)
+        .output()
+        .context("Failed to run jj git remote list")?;
+
+    if !output.status.success() {
+        bail!("jj git remote list failed");
+    }
+
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    for line in stdout.lines() {
+        let parts: Vec<&str> = line.splitn(2, char::is_whitespace).collect();
+        if parts.len() == 2 && parts[0].trim() == "origin" {
+            return Ok(parts[1].trim().to_string());
+        }
+    }
+
+    bail!("No 'origin' remote found");
+}
+
+/// Parse namespace and repo from a GitHub remote URL
+fn parse_github_url(url: &str) -> Result<(String, String)> {
+    // Handle git@github.com:owner/repo.git
+    if let Some(rest) = url.strip_prefix("git@github.com:") {
+        let path = rest.strip_suffix(".git").unwrap_or(rest);
+        let parts: Vec<&str> = path.splitn(2, '/').collect();
+        if parts.len() == 2 {
+            return Ok((parts[0].to_string(), parts[1].to_string()));
+        }
+    }
+    // Handle https://github.com/owner/repo.git
+    if let Some(rest) = url.strip_prefix("https://github.com/") {
+        let path = rest.strip_suffix(".git").unwrap_or(rest);
+        let parts: Vec<&str> = path.splitn(2, '/').collect();
+        if parts.len() == 2 {
+            return Ok((parts[0].to_string(), parts[1].to_string()));
+        }
+    }
+    // Handle ssh://git@github.com/owner/repo.git
+    if let Some(rest) = url.strip_prefix("ssh://git@github.com/") {
+        let path = rest.strip_suffix(".git").unwrap_or(rest);
+        let parts: Vec<&str> = path.splitn(2, '/').collect();
+        if parts.len() == 2 {
+            return Ok((parts[0].to_string(), parts[1].to_string()));
+        }
+    }
+    bail!("Cannot parse GitHub URL: {}", url);
+}
+
+/// Check if a jj bookmark exists locally
+fn bookmark_exists_local(repo_path: &Path, name: &str) -> bool {
+    Command::new("jj")
+        .args(["bookmark", "list", name])
+        .current_dir(repo_path)
+        .output()
+        .map(|o| {
+            o.status.success() && {
+                let stdout = String::from_utf8_lossy(&o.stdout);
+                stdout.lines().any(|l| l.starts_with(name))
+            }
+        })
+        .unwrap_or(false)
+}
+
+/// Check if a jj bookmark exists on origin
+fn bookmark_exists_remote(repo_path: &Path, name: &str) -> bool {
+    Command::new("jj")
+        .args(["bookmark", "list", "--all-remotes", name])
+        .current_dir(repo_path)
+        .output()
+        .map(|o| {
+            o.status.success() && {
+                let stdout = String::from_utf8_lossy(&o.stdout);
+                let remote_marker = format!("{}@origin", name);
+                stdout.lines().any(|l| l.contains(&remote_marker))
+            }
+        })
+        .unwrap_or(false)
+}
+
+/// Sanitize a branch name for use as a jj workspace name
+fn sanitize_workspace_name(branch_name: &str) -> String {
+    branch_name.replace('/', "_")
+}
+
 /// Ensure the source repo exists at ~/sources/<namespace>/<repo>
 fn ensure_source_repo(source_repo_path: &Path, namespace: &str, repo: &str) -> Result<()> {
     if source_repo_path.exists() {
-        // Repo already exists, fetch latest
+        // If source repo exists but doesn't have .jj, colocate it
+        if !source_repo_path.join(".jj").exists() {
+            println!("Initializing jj in existing git repo...");
+            let status = Command::new("jj")
+                .args(["git", "init", "--colocate"])
+                .current_dir(source_repo_path)
+                .status()
+                .context("Failed to run jj git init --colocate")?;
+            if !status.success() {
+                bail!("jj git init --colocate failed");
+            }
+        }
+
         println!("Source repo exists, fetching latest...");
-        let status = Command::new("git")
-            .args(["fetch", "--all"])
+        let status = Command::new("jj")
+            .args(["git", "fetch", "--all-remotes"])
             .current_dir(source_repo_path)
             .status()
-            .context("Failed to run git fetch")?;
+            .context("Failed to run jj git fetch")?;
         if !status.success() {
-            bail!("git fetch failed");
+            bail!("jj git fetch failed");
         }
         return Ok(());
     }
@@ -198,119 +298,104 @@ fn ensure_source_repo(source_repo_path: &Path, namespace: &str, repo: &str) -> R
     let parent = source_repo_path.parent().unwrap();
     fs::create_dir_all(parent).with_context(|| format!("Failed to create {}", parent.display()))?;
 
-    // Clone the repo using SSH
+    // Clone the repo using jj with git colocation
     let ssh_url = format!("git@github.com:{}/{}.git", namespace, repo);
     println!("Cloning {} to {}...", ssh_url, source_repo_path.display());
 
-    let status = Command::new("git")
-        .args(["clone", &ssh_url, source_repo_path.to_str().unwrap()])
+    let status = Command::new("jj")
+        .args([
+            "git",
+            "clone",
+            "--colocate",
+            &ssh_url,
+            source_repo_path.to_str().unwrap(),
+        ])
         .status()
-        .context("Failed to run git clone")?;
+        .context("Failed to run jj git clone")?;
 
     if !status.success() {
-        bail!("git clone failed");
+        bail!("jj git clone failed");
     }
 
     Ok(())
 }
 
-/// Create a worktree at target_dir for the given branch
-fn do_worktree(source_repo_path: &Path, target_dir: &Path, branch_name: &str) -> Result<()> {
-    // Check if branch exists remotely
-    let branch_exists = Command::new("git")
+/// Create a jj workspace at target_dir for the given branch
+fn do_workspace(source_repo_path: &Path, target_dir: &Path, branch_name: &str) -> Result<()> {
+    let ws_name = sanitize_workspace_name(branch_name);
+
+    // Create the workspace
+    let status = Command::new("jj")
         .args([
-            "show-ref",
-            "--verify",
-            "--quiet",
-            &format!("refs/heads/{}", branch_name),
+            "workspace",
+            "add",
+            "--name",
+            &ws_name,
+            target_dir.to_str().unwrap(),
         ])
         .current_dir(source_repo_path)
         .status()
-        .map(|s| s.success())
-        .unwrap_or(false);
+        .context("Failed to run jj workspace add")?;
 
-    let remote_branch_exists = Command::new("git")
-        .args([
-            "show-ref",
-            "--verify",
-            "--quiet",
-            &format!("refs/remotes/origin/{}", branch_name),
-        ])
-        .current_dir(source_repo_path)
-        .status()
-        .map(|s| s.success())
-        .unwrap_or(false);
+    if !status.success() {
+        bail!("jj workspace add failed");
+    }
 
-    if branch_exists {
-        // Branch exists locally, create worktree
-        let status = Command::new("git")
-            .args(["worktree", "add", target_dir.to_str().unwrap(), branch_name])
-            .current_dir(source_repo_path)
+    // Navigate the workspace to the right bookmark
+    let local_exists = bookmark_exists_local(source_repo_path, branch_name);
+    let remote_exists = bookmark_exists_remote(source_repo_path, branch_name);
+
+    if local_exists {
+        let status = Command::new("jj")
+            .args(["new", branch_name])
+            .current_dir(target_dir)
             .status()
-            .context("Failed to run git worktree add")?;
+            .context("Failed to run jj new")?;
 
         if !status.success() {
-            bail!("git worktree add failed");
+            bail!("jj new {} failed", branch_name);
         }
-    } else if remote_branch_exists {
-        // Branch exists on remote, create worktree tracking it
-        let status = Command::new("git")
-            .args([
-                "worktree",
-                "add",
-                "--track",
-                "-b",
-                branch_name,
-                target_dir.to_str().unwrap(),
-                &format!("origin/{}", branch_name),
-            ])
-            .current_dir(source_repo_path)
+    } else if remote_exists {
+        // Track the remote bookmark first
+        let status = Command::new("jj")
+            .args(["bookmark", "track", &format!("{}@origin", branch_name)])
+            .current_dir(target_dir)
             .status()
-            .context("Failed to run git worktree add")?;
+            .context("Failed to track remote bookmark")?;
 
         if !status.success() {
-            bail!("git worktree add failed");
+            bail!("jj bookmark track failed");
+        }
+
+        let status = Command::new("jj")
+            .args(["new", branch_name])
+            .current_dir(target_dir)
+            .status()
+            .context("Failed to run jj new")?;
+
+        if !status.success() {
+            bail!("jj new {} failed", branch_name);
         }
     } else {
-        // Branch doesn't exist, create new branch from default branch
-        // First, find the default branch
-        // let output = Command::new("git")
-        //     .args(["symbolic-ref", "refs/remotes/origin/HEAD"])
-        //     .current_dir(source_repo_path)
-        //     .output()
-        //     .context("Failed to get default branch")?;
-
-        // let default_branch = if output.status.success() {
-        //     String::from_utf8_lossy(&output.stdout)
-        //         .trim()
-        //         .strip_prefix("refs/remotes/origin/")
-        //         .unwrap_or("master")
-        //         .to_string()
-        // } else {
-        //     "master".to_string()
-        // };
-
-        // println!(
-        //     "Branch '{}' doesn't exist, creating from '{}'...",
-        //     branch_name, default_branch
-        // );
-
-        let status = Command::new("git")
-            .args([
-                "worktree",
-                "add",
-                "--guess-remote",
-                "-b",
-                branch_name,
-                target_dir.to_str().unwrap(),
-                // &format!("origin/{}", default_branch),
-            ])
-            .current_dir(source_repo_path)
+        // Bookmark doesn't exist anywhere — create on top of trunk
+        let status = Command::new("jj")
+            .args(["new", "trunk()"])
+            .current_dir(target_dir)
             .status()
-            .context("Failed to run git worktree add")?;
+            .context("Failed to run jj new trunk()")?;
 
         if !status.success() {
-            bail!("git worktree add failed");
+            bail!("jj new trunk() failed");
+        }
+
+        let status = Command::new("jj")
+            .args(["bookmark", "create", branch_name])
+            .current_dir(target_dir)
+            .status()
+            .context("Failed to create bookmark")?;
+
+        if !status.success() {
+            bail!("jj bookmark create {} failed", branch_name);
         }
     }
 
@@ -319,86 +404,73 @@ fn do_worktree(source_repo_path: &Path, target_dir: &Path, branch_name: &str) ->
 
 /// Do a full (deep) clone at target_dir
 fn do_deep_clone(source_repo_path: &Path, target_dir: &Path, branch_name: &str) -> Result<()> {
-    // Get the remote URL from the source repo
-    let output = Command::new("git")
-        .args(["remote", "get-url", "origin"])
-        .current_dir(source_repo_path)
-        .output()
-        .context("Failed to get remote URL")?;
+    let remote_url = get_remote_url(source_repo_path)?;
 
-    if !output.status.success() {
-        bail!("Failed to get remote URL from source repo");
-    }
-
-    let remote_url = String::from_utf8_lossy(&output.stdout).trim().to_string();
-
-    // Clone the repo
     println!("Deep cloning {} to {}...", remote_url, target_dir.display());
-    let status = Command::new("git")
-        .args(["clone", &remote_url, target_dir.to_str().unwrap()])
+    let status = Command::new("jj")
+        .args([
+            "git",
+            "clone",
+            "--colocate",
+            &remote_url,
+            target_dir.to_str().unwrap(),
+        ])
         .status()
-        .context("Failed to run git clone")?;
+        .context("Failed to run jj git clone")?;
 
     if !status.success() {
-        bail!("git clone failed");
+        bail!("jj git clone failed");
     }
 
-    // Check if branch exists
-    let branch_exists = Command::new("git")
-        .args([
-            "show-ref",
-            "--verify",
-            "--quiet",
-            &format!("refs/remotes/origin/{}", branch_name),
-        ])
-        .current_dir(target_dir)
-        .status()
-        .map(|s| s.success())
-        .unwrap_or(false);
+    // Navigate to the bookmark
+    let local_exists = bookmark_exists_local(target_dir, branch_name);
+    let remote_exists = bookmark_exists_remote(target_dir, branch_name);
 
-    if branch_exists {
-        // Checkout the branch
-        let status = Command::new("git")
-            .args([
-                "checkout",
-                "-b",
-                branch_name,
-                &format!("origin/{}", branch_name),
-            ])
-            .current_dir(target_dir)
-            .status()
-            .context("Failed to checkout branch")?;
-
-        if !status.success() {
-            // Maybe the branch exists locally already
-            let status = Command::new("git")
-                .args(["checkout", branch_name])
+    if local_exists || remote_exists {
+        if remote_exists && !local_exists {
+            Command::new("jj")
+                .args(["bookmark", "track", &format!("{}@origin", branch_name)])
                 .current_dir(target_dir)
                 .status()
-                .context("Failed to checkout branch")?;
-
-            if !status.success() {
-                bail!("Failed to checkout branch {}", branch_name);
-            }
+                .context("Failed to track remote bookmark")?;
         }
-    } else {
-        // Create the branch
-        println!(
-            "Branch '{}' doesn't exist remotely, creating new branch...",
-            branch_name
-        );
-        let status = Command::new("git")
-            .args(["checkout", "-b", branch_name])
+
+        let status = Command::new("jj")
+            .args(["new", branch_name])
             .current_dir(target_dir)
             .status()
-            .context("Failed to create branch")?;
+            .context("Failed to run jj new")?;
 
         if !status.success() {
-            bail!("Failed to create branch {}", branch_name);
+            bail!("jj new {} failed", branch_name);
+        }
+    } else {
+        println!(
+            "Bookmark '{}' doesn't exist, creating new bookmark...",
+            branch_name
+        );
+        let status = Command::new("jj")
+            .args(["new", "trunk()"])
+            .current_dir(target_dir)
+            .status()
+            .context("Failed to run jj new trunk()")?;
+
+        if !status.success() {
+            bail!("jj new trunk() failed");
+        }
+
+        let status = Command::new("jj")
+            .args(["bookmark", "create", branch_name])
+            .current_dir(target_dir)
+            .status()
+            .context("Failed to create bookmark")?;
+
+        if !status.success() {
+            bail!("jj bookmark create {} failed", branch_name);
         }
     }
 
-    // Initialize submodules if present
+    // Initialize submodules if present (still uses git — jj doesn't handle submodules)
     let gitmodules = target_dir.join(".gitmodules");
     if gitmodules.exists() {
         println!("Initializing submodules...");
@@ -464,7 +536,7 @@ fn cmd_migrate(trees_path: &Path, dry_run: bool) -> Result<()> {
 }
 
 /// Recursively find directories that should have branch.toml
-/// A branch directory is the parent of a directory containing .git
+/// A branch directory is the parent of a directory containing .git or .jj
 fn find_branch_dirs(
     base_path: &Path,
     current_path: &Path,
@@ -487,9 +559,10 @@ fn find_branch_dirs(
             continue;
         }
 
-        // Check if this directory contains a .git (worktree or full clone)
-        let git_path = path.join(".git");
-        if git_path.exists() {
+        // Check if this directory contains a .git or .jj (repo or workspace)
+        let has_git = path.join(".git").exists();
+        let has_jj = path.join(".jj").exists();
+        if has_git || has_jj {
             // This is a repo - the branch name is the path from base to parent
             let branch_dir = current_path;
             let branch_name = branch_dir
@@ -529,20 +602,7 @@ fn cmd_nix_remote(repo: &str) -> Result<()> {
         bail!("Repo '{}' not found at {}", repo, repo_path.display());
     }
 
-    // Get the remote origin URL
-    let output = Command::new("git")
-        .args(["remote", "get-url", "origin"])
-        .current_dir(&repo_path)
-        .output()
-        .context("Failed to run git remote get-url")?;
-
-    if !output.status.success() {
-        bail!("Failed to get remote URL for {}", repo);
-    }
-
-    let remote_url = String::from_utf8_lossy(&output.stdout).trim().to_string();
-
-    // Convert git@github.com:owner/repo.git to git+ssh://git@github.com/owner/repo
+    let remote_url = get_remote_url(&repo_path)?;
     let nix_url = convert_to_nix_ssh_url(&remote_url, branch_name)?;
     print!("{}", nix_url);
 
@@ -585,6 +645,7 @@ fn convert_to_nix_ssh_url(remote_url: &str, branch: &str) -> Result<String> {
 fn cmd_nix_local(repo: &str) -> Result<()> {
     let toml_path =
         find_branch_toml().context("No branch.toml found in current or parent directories")?;
+    let config = read_branch_config(&toml_path)?;
     let branch_dir = toml_path.parent().unwrap();
 
     // Find the sibling repo
@@ -593,11 +654,39 @@ fn cmd_nix_local(repo: &str) -> Result<()> {
         bail!("Repo '{}' not found at {}", repo, repo_path.display());
     }
 
-    let canonical_path = repo_path
-        .canonicalize()
-        .with_context(|| format!("Failed to resolve path: {}", repo_path.display()))?;
+    if repo_path.join(".git").exists() {
+        // Deep clone or colocated repo — has .git, use directly
+        let canonical_path = repo_path
+            .canonicalize()
+            .with_context(|| format!("Failed to resolve path: {}", repo_path.display()))?;
+        print!("git+file://{}", canonical_path.display());
+    } else {
+        // jj workspace — no .git, point to the source repo with ?ref=
+        let remote_url = get_remote_url(&repo_path)?;
+        let (namespace, repo_name) = parse_github_url(&remote_url)?;
+        let home = env::var("HOME").context("HOME not set")?;
+        let source_path = PathBuf::from(home)
+            .join("sources")
+            .join(&namespace)
+            .join(&repo_name);
 
-    print!("git+file://{}", canonical_path.display());
+        if !source_path.exists() {
+            bail!(
+                "Source repo not found at {} (expected for workspace {})",
+                source_path.display(),
+                repo_path.display()
+            );
+        }
+
+        let canonical_path = source_path
+            .canonicalize()
+            .with_context(|| format!("Failed to resolve path: {}", source_path.display()))?;
+        print!(
+            "git+file://{}?ref={}",
+            canonical_path.display(),
+            config.branch
+        );
+    }
 
     Ok(())
 }
@@ -632,12 +721,12 @@ fn cmd_show_branch() -> Result<()> {
 }
 
 fn print_usage() {
-    eprintln!("branch - A utility for managing git worktrees across multiple repos");
+    eprintln!("branch - A utility for managing jj workspaces across multiple repos");
     eprintln!();
     eprintln!("USAGE:");
     eprintln!("    branch                              Show current branch (from branch.toml)");
     eprintln!("    branch new <branch_name>            Create a new branch directory");
-    eprintln!("    branch clone <ns> <repo>            Clone repo as worktree");
+    eprintln!("    branch clone <ns> <repo>            Clone repo as jj workspace");
     eprintln!("    branch clone --deep <ns> <repo>     Clone repo fully (for submodules)");
     eprintln!("    branch migrate <trees_path>         Migrate existing structure to branch.toml");
     eprintln!("    branch migrate --dry-run <path>     Preview migration without changes");
