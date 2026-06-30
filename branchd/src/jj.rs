@@ -18,9 +18,15 @@ pub struct Commit {
     /// or status couldn't be fetched (treated as not-draft for filtering).
     pub is_draft: Option<bool>,
     /// Authoritative PR title as last set on GitHub. `None` when there's no
-    /// PR or the gh lookup didn't return this PR (e.g. closed/merged). Callers
-    /// should prefer this over `title` whenever it's populated.
+    /// PR or the gh lookup didn't return this PR. Callers should prefer this
+    /// over `title` whenever it's populated.
     pub pr_title: Option<String>,
+    /// PR lifecycle state from GitHub. `None` when no PR is referenced or the
+    /// gh lookup didn't return a row for it (e.g. older than the gh window).
+    pub pr_state: Option<crate::gh::PrState>,
+    /// PR review decision from GitHub. `None` for the same reasons as
+    /// `pr_state`; otherwise `Approved`/`ChangesRequested`/`ReviewRequired`/`None`.
+    pub review_decision: Option<crate::gh::ReviewDecision>,
 }
 
 /// One line of jj log output. `graph` is the raw box-drawing prefix
@@ -179,6 +185,8 @@ fn run_graph_log(repo: &Path, revset: Option<&str>) -> Result<Vec<LogLine>> {
                         pr_number: None,
                         is_draft: None,
                         pr_title: None,
+                        pr_state: None,
+                        review_decision: None,
                     }),
                 });
             }

@@ -3,38 +3,57 @@ use axum::{
     extract::{Path, State},
     http::StatusCode,
     response::{Html, IntoResponse},
-    routing::get,
+    routing::{get, post},
     Router,
 };
 use std::collections::{HashMap, HashSet};
 use std::net::SocketAddr;
 use std::path::PathBuf;
 use std::sync::Arc;
+use std::time::{Duration, SystemTime};
+use tokio::sync::{Mutex, RwLock};
 
 use crate::discovery::{self, RepoKind, Workspace};
 use crate::{gh, jj};
 
-/// Walk every commit in `groups`, batch-fetch open PR metadata from GitHub
-/// once per unique repo, and set `is_draft` + `pr_title` on each commit in
-/// place. `pr_title` is what GitHub considers authoritative — we prefer it
-/// over the local jj commit title when rendering.
-fn annotate_drafts(groups: &mut [&mut [jj::LogLine]]) {
-    let mut repos: HashSet<(String, String)> = HashSet::new();
-    for group in groups.iter() {
-        for line in group.iter() {
-            if let Some(c) = &line.commit {
-                if let Some(url) = &c.pr_url {
-                    if let Some((owner, repo, _)) = gh::parse_pr_url(url) {
-                        repos.insert((owner, repo));
-                    }
-                }
-            }
+const REFRESH_INTERVAL: Duration = Duration::from_secs(300);
+
+/// Snapshot of the PR cache passed into render functions. Cheap to clone —
+/// holds ~hundreds of small `PrInfo` entries.
+#[derive(Default, Clone)]
+struct CacheSnapshot {
+    map: HashMap<(String, String, u64), gh::PrInfo>,
+    last_sync: Option<SystemTime>,
+}
+
+/// Shared mutable cache populated by the background refresh task and the
+/// `/resync` endpoint. Renderers take a cloned `CacheSnapshot` and never touch
+/// the lock themselves, so a slow render can't starve a refresh.
+struct PrCacheInner {
+    map: HashMap<(String, String, u64), gh::PrInfo>,
+    last_sync: Option<SystemTime>,
+}
+
+impl PrCacheInner {
+    fn snapshot(&self) -> CacheSnapshot {
+        CacheSnapshot {
+            map: self.map.clone(),
+            last_sync: self.last_sync,
         }
     }
-    if repos.is_empty() {
+}
+
+/// Apply cached PR metadata to every commit in `groups`. Pure (no I/O): the
+/// cache is populated out-of-band by the background refresh task. Sets
+/// `is_draft`, `pr_title`, `pr_state`, and `review_decision`; commits whose PRs
+/// haven't been fetched yet render in fallback form (plain "PR" badge).
+fn annotate_drafts(
+    groups: &mut [&mut [jj::LogLine]],
+    map: &HashMap<(String, String, u64), gh::PrInfo>,
+) {
+    if map.is_empty() {
         return;
     }
-    let map = gh::fetch_pr_map(&repos);
     for group in groups.iter_mut() {
         for line in group.iter_mut() {
             if let Some(c) = line.commit.as_mut() {
@@ -43,6 +62,8 @@ fn annotate_drafts(groups: &mut [&mut [jj::LogLine]]) {
                         if let Some(info) = map.get(&key) {
                             c.is_draft = Some(info.is_draft);
                             c.pr_title = Some(info.title.clone());
+                            c.pr_state = Some(info.state);
+                            c.review_decision = Some(info.review_decision);
                         }
                     }
                 }
@@ -59,6 +80,26 @@ fn has_any_jj(ws: &Workspace) -> bool {
 /// (when the PR is open and gh returned it) over the local jj commit
 /// description.first_line(), which may be stale relative to renames done
 /// via `gh pr edit`.
+/// Build the trailing markdown status tag for a PR bullet. Order matters:
+/// `closed`/`merged` short-circuit `draft`. The trailing space ensures the
+/// `` `draft` ``-tail regex in the show-drafts JS filter still matches.
+fn md_status_tag(c: &jj::Commit) -> String {
+    match c.pr_state {
+        Some(gh::PrState::Closed) => " `closed`".to_string(),
+        Some(gh::PrState::Merged) => " `merged`".to_string(),
+        _ => {
+            let mut s = String::new();
+            if c.review_decision == Some(gh::ReviewDecision::Approved) {
+                s.push_str(" \u{2705}");
+            }
+            if c.is_draft == Some(true) {
+                s.push_str(" `draft`");
+            }
+            s
+        }
+    }
+}
+
 fn display_title<'a>(c: &'a jj::Commit) -> &'a str {
     c.pr_title
         .as_deref()
@@ -76,18 +117,51 @@ fn display_title<'a>(c: &'a jj::Commit) -> &'a str {
 struct AppState {
     root: Arc<PathBuf>,
     sources: Arc<PathBuf>,
+    cache: Arc<RwLock<PrCacheInner>>,
+    /// Held for the duration of a refresh. Ensures /resync calls serialize and
+    /// don't pile up parallel `gh pr list` runs against the same repos.
+    refresh_lock: Arc<Mutex<()>>,
 }
 
 pub async fn serve(addrs: Vec<SocketAddr>, root: PathBuf, sources: PathBuf) -> Result<()> {
     let state = AppState {
         root: Arc::new(root),
         sources: Arc::new(sources),
+        cache: Arc::new(RwLock::new(PrCacheInner {
+            map: HashMap::new(),
+            last_sync: None,
+        })),
+        refresh_lock: Arc::new(Mutex::new(())),
     };
+
+    // Initial fetch in the background so the daemon starts serving immediately
+    // (first request may show "syncing…" until this finishes).
+    tokio::spawn({
+        let state = state.clone();
+        async move {
+            refresh_cache(&state, "initial").await;
+        }
+    });
+    // Periodic refresh every 5 minutes.
+    tokio::spawn({
+        let state = state.clone();
+        async move {
+            let mut interval = tokio::time::interval(REFRESH_INTERVAL);
+            // Skip the immediate first tick — the spawn above handles initial fetch.
+            interval.tick().await;
+            loop {
+                interval.tick().await;
+                refresh_cache(&state, "scheduled").await;
+            }
+        }
+    });
+
     let app = Router::new()
         .route("/", get(index))
         .route("/w/*branch", get(workspace_view))
         .route("/sources", get(sources_index))
         .route("/s/*nsrepo", get(source_view))
+        .route("/resync", post(resync))
         .route("/healthz", get(healthz))
         .with_state(state);
 
@@ -111,13 +185,101 @@ pub async fn serve(addrs: Vec<SocketAddr>, root: PathBuf, sources: PathBuf) -> R
     Ok(())
 }
 
+/// Walk every workspace and source repo, collect the (owner, repo) pairs
+/// referenced by PR trailers, run `gh pr list` once per repo, then store the
+/// resulting map. Serialized via `refresh_lock` so only one runs at a time.
+/// `source` is a short tag included in log lines ("initial", "scheduled",
+/// "user").
+async fn refresh_cache(state: &AppState, source: &str) {
+    let waiting_started = std::time::Instant::now();
+    let _guard = state.refresh_lock.lock().await;
+    let waited = waiting_started.elapsed();
+    if waited.as_millis() > 50 {
+        eprintln!(
+            "refresh[{source}]: queued behind another refresh for {:.1}s",
+            waited.as_secs_f64()
+        );
+    }
+    eprintln!("refresh[{source}]: starting");
+    let started = std::time::Instant::now();
+    let root = state.root.clone();
+    let sources = state.sources.clone();
+    let result = tokio::task::spawn_blocking(move || {
+        let mut repos: HashSet<(String, String)> = HashSet::new();
+        if let Ok(workspaces) = discovery::scan(&root) {
+            for ws in workspaces {
+                for r in &ws.repos {
+                    if r.kind != RepoKind::Jj {
+                        continue;
+                    }
+                    if let Ok(lines) = jj::stack(&r.path) {
+                        for line in lines {
+                            if let Some(c) = line.commit {
+                                if let Some(url) = &c.pr_url {
+                                    if let Some((o, n, _)) = gh::parse_pr_url(url) {
+                                        repos.insert((o, n));
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        if let Ok(srcs) = discovery::scan_sources(&sources) {
+            for s in srcs {
+                if let Ok(lines) = jj::default_log(&s.path) {
+                    for line in lines {
+                        if let Some(c) = line.commit {
+                            if let Some(url) = &c.pr_url {
+                                if let Some((o, n, _)) = gh::parse_pr_url(url) {
+                                    repos.insert((o, n));
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        let repo_count = repos.len();
+        let map = gh::fetch_pr_map(&repos);
+        (repo_count, map)
+    })
+    .await;
+    let (repo_count, map) = match result {
+        Ok(v) => v,
+        Err(e) => {
+            eprintln!("refresh[{source}]: join error: {e}");
+            return;
+        }
+    };
+    let pr_count = map.len();
+    let mut w = state.cache.write().await;
+    w.map = map;
+    w.last_sync = Some(SystemTime::now());
+    eprintln!(
+        "refresh[{source}]: done in {:.1}s ({repo_count} repos, {pr_count} PRs)",
+        started.elapsed().as_secs_f64()
+    );
+}
+
+async fn cache_snapshot(state: &AppState) -> CacheSnapshot {
+    state.cache.read().await.snapshot()
+}
+
+async fn resync(State(state): State<AppState>) -> impl IntoResponse {
+    refresh_cache(&state, "user").await;
+    StatusCode::OK
+}
+
 async fn healthz() -> &'static str {
     "ok\n"
 }
 
 async fn index(State(state): State<AppState>) -> impl IntoResponse {
     let root = state.root.clone();
-    let body = tokio::task::spawn_blocking(move || render_index(&root))
+    let snap = cache_snapshot(&state).await;
+    let body = tokio::task::spawn_blocking(move || render_index(&root, &snap))
         .await
         .unwrap_or_else(|e| format!("<pre>join error: {e}</pre>"));
     Html(body)
@@ -128,7 +290,8 @@ async fn workspace_view(
     Path(branch): Path<String>,
 ) -> impl IntoResponse {
     let root = state.root.clone();
-    let result = tokio::task::spawn_blocking(move || render_one(&root, &branch))
+    let snap = cache_snapshot(&state).await;
+    let result = tokio::task::spawn_blocking(move || render_one(&root, &branch, &snap))
         .await
         .unwrap_or_else(|e| Err(format!("join error: {e}")));
     match result {
@@ -139,7 +302,8 @@ async fn workspace_view(
 
 async fn sources_index(State(state): State<AppState>) -> impl IntoResponse {
     let sources = state.sources.clone();
-    let body = tokio::task::spawn_blocking(move || render_sources_index(&sources))
+    let snap = cache_snapshot(&state).await;
+    let body = tokio::task::spawn_blocking(move || render_sources_index(&sources, &snap))
         .await
         .unwrap_or_else(|e| format!("<pre>join error: {e}</pre>"));
     Html(body)
@@ -151,9 +315,11 @@ async fn source_view(
 ) -> impl IntoResponse {
     let sources = state.sources.clone();
     let root = state.root.clone();
-    let result = tokio::task::spawn_blocking(move || render_source(&sources, &root, &nsrepo))
-        .await
-        .unwrap_or_else(|e| Err(format!("join error: {e}")));
+    let snap = cache_snapshot(&state).await;
+    let result =
+        tokio::task::spawn_blocking(move || render_source(&sources, &root, &nsrepo, &snap))
+            .await
+            .unwrap_or_else(|e| Err(format!("join error: {e}")));
     match result {
         Ok(body) => (StatusCode::OK, Html(body)),
         Err(msg) => (StatusCode::NOT_FOUND, Html(error_page(&msg))),
@@ -191,10 +357,10 @@ fn build_commit_tags(root: &PathBuf) -> CommitTags {
     map
 }
 
-/// Fetch jj::stack for each jj repo in `ws`, batch-annotate drafts in one
-/// gh call, return pairs of (repo_name, lines). Trims the leading empty/
-/// no-description commit (jj's working copy `@`) off each stack.
-fn fetch_ws_lines(ws: &Workspace) -> Vec<(String, Vec<jj::LogLine>)> {
+/// Fetch jj::stack for each jj repo in `ws`, annotate from the cache snapshot,
+/// return pairs of (repo_name, lines). Trims the leading empty/no-description
+/// commit (jj's working copy `@`) off each stack.
+fn fetch_ws_lines(ws: &Workspace, snap: &CacheSnapshot) -> Vec<(String, Vec<jj::LogLine>)> {
     let mut pairs: Vec<(String, Vec<jj::LogLine>)> = Vec::new();
     for repo in &ws.repos {
         if repo.kind != RepoKind::Jj {
@@ -204,7 +370,7 @@ fn fetch_ws_lines(ws: &Workspace) -> Vec<(String, Vec<jj::LogLine>)> {
         pairs.push((repo.name.clone(), lines));
     }
     let mut slices: Vec<&mut [jj::LogLine]> = pairs.iter_mut().map(|(_, v)| v.as_mut_slice()).collect();
-    annotate_drafts(&mut slices);
+    annotate_drafts(&mut slices, &snap.map);
     pairs
 }
 
@@ -236,14 +402,14 @@ fn trim_top_empty(lines: Vec<jj::LogLine>) -> Vec<jj::LogLine> {
     out
 }
 
-fn render_index(root: &PathBuf) -> String {
+fn render_index(root: &PathBuf, snap: &CacheSnapshot) -> String {
     let workspaces: Vec<Workspace> = match discovery::scan(root) {
         Ok(v) => v.into_iter().filter(has_any_jj).collect(),
         Err(e) => return error_page(&format!("scan failed: {e:#}")),
     };
     let mut body = String::new();
     body.push_str(PAGE_HEAD);
-    render_nav(&mut body, "workspaces");
+    render_nav(&mut body, "workspaces", snap);
     render_controls(&mut body);
     body.push_str(&format!(
         "<p class=\"sub\">root: <code>{}</code> &middot; {} workspace{}</p>\n",
@@ -256,14 +422,14 @@ fn render_index(root: &PathBuf) -> String {
     }
     let no_tags: CommitTags = HashMap::new();
     for ws in &workspaces {
-        let repo_lines = fetch_ws_lines(ws);
+        let repo_lines = fetch_ws_lines(ws, snap);
         render_workspace(&mut body, ws, &repo_lines, &no_tags, Some(&ws.branch));
     }
     body.push_str(PAGE_TAIL);
     body
 }
 
-fn render_one(root: &PathBuf, branch: &str) -> Result<String, String> {
+fn render_one(root: &PathBuf, branch: &str, snap: &CacheSnapshot) -> Result<String, String> {
     let workspaces = discovery::scan(root).map_err(|e| format!("scan failed: {e:#}"))?;
     let ws = workspaces
         .into_iter()
@@ -271,24 +437,24 @@ fn render_one(root: &PathBuf, branch: &str) -> Result<String, String> {
         .ok_or_else(|| format!("no jj workspace with branch {branch:?}"))?;
     let mut body = String::new();
     body.push_str(PAGE_HEAD);
-    render_nav(&mut body, "workspaces");
+    render_nav(&mut body, "workspaces", snap);
     render_controls(&mut body);
     body.push_str("<p class=\"sub\"><a href=\"/\">&larr; all workspaces</a></p>\n");
     let no_tags: CommitTags = HashMap::new();
-    let repo_lines = fetch_ws_lines(&ws);
+    let repo_lines = fetch_ws_lines(&ws, snap);
     render_workspace(&mut body, &ws, &repo_lines, &no_tags, Some(&ws.branch));
     body.push_str(PAGE_TAIL);
     Ok(body)
 }
 
-fn render_sources_index(sources_root: &PathBuf) -> String {
+fn render_sources_index(sources_root: &PathBuf, snap: &CacheSnapshot) -> String {
     let repos = match discovery::scan_sources(sources_root) {
         Ok(v) => v,
         Err(e) => return error_page(&format!("scan_sources failed: {e:#}")),
     };
     let mut body = String::new();
     body.push_str(PAGE_HEAD);
-    render_nav(&mut body, "sources");
+    render_nav(&mut body, "sources", snap);
     body.push_str(&format!(
         "<p class=\"sub\">root: <code>{}</code> &middot; {} source{}</p>\n",
         html_escape(&sources_root.display().to_string()),
@@ -332,6 +498,7 @@ fn render_source(
     sources_root: &PathBuf,
     workspace_root: &PathBuf,
     nsrepo: &str,
+    snap: &CacheSnapshot,
 ) -> Result<String, String> {
     let (ns, name) = nsrepo
         .split_once('/')
@@ -348,7 +515,7 @@ fn render_source(
         .map_err(|e| format!("jj log failed: {e:#}"))?;
     {
         let mut slices = [lines.as_mut_slice()];
-        annotate_drafts(&mut slices[..]);
+        annotate_drafts(&mut slices[..], &snap.map);
     }
     let focused = focus_on_open(lines);
 
@@ -388,7 +555,7 @@ fn render_source(
 
     let mut body = String::new();
     body.push_str(PAGE_HEAD);
-    render_nav(&mut body, "sources");
+    render_nav(&mut body, "sources", snap);
     render_controls(&mut body);
     body.push_str(&format!(
         "<p class=\"sub\"><a href=\"/sources\">&larr; all sources</a> &middot; <code>{}</code></p>\n",
@@ -442,7 +609,7 @@ fn focus_on_open(lines: Vec<jj::LogLine>) -> Vec<jj::LogLine> {
         c.parents.len() >= 2 || child_count.get(&c.commit_id).copied().unwrap_or(0) >= 2
     };
     let has_open_pr = |c: &jj::Commit| -> bool {
-        c.pr_url.is_some() && c.is_draft.is_some()
+        c.pr_url.is_some() && c.pr_state == Some(gh::PrState::Open)
     };
 
     // Anchor the window between the first and last commit *with an open PR* —
@@ -547,9 +714,9 @@ fn build_repo_md(name: &str, lines: &[jj::LogLine], indent: bool) -> String {
             .pr_number
             .map(|n| format!("#{n}"))
             .unwrap_or_else(|| "PR".to_string());
-        let draft_tag = if c.is_draft == Some(true) { " `draft`" } else { "" };
+        let status_tag = md_status_tag(c);
         let title = display_title(c);
-        out.push_str(&format!("- [{label}]({url}) {title}{draft_tag}\n"));
+        out.push_str(&format!("- [{label}]({url}) {title}{status_tag}\n"));
     }
     out.push('\n');
     out
@@ -580,7 +747,7 @@ fn build_source_md(
             .pr_number
             .map(|n| format!("#{n}"))
             .unwrap_or_else(|| "PR".to_string());
-        let draft_tag = if c.is_draft == Some(true) { " `draft`" } else { "" };
+        let status_tag = md_status_tag(c);
         let title = display_title(c);
         let ws_suffix = tags
             .get(&c.commit_id)
@@ -599,7 +766,7 @@ fn build_source_md(
             })
             .unwrap_or_default();
         out.push_str(&format!(
-            "- [{label}]({url}) {title}{draft_tag}{ws_suffix}\n"
+            "- [{label}]({url}) {title}{status_tag}{ws_suffix}\n"
         ));
     }
     out
@@ -628,16 +795,53 @@ fn id_slug(s: &str) -> String {
         .collect()
 }
 
-fn render_nav(body: &mut String, active: &str) {
+fn render_nav(body: &mut String, active: &str, snap: &CacheSnapshot) {
     let workspaces_class = if active == "workspaces" { " active" } else { "" };
     let sources_class = if active == "sources" { " active" } else { "" };
+    let sync_status = render_sync_status(snap);
     body.push_str(&format!(
         "<nav class=\"top\"><a class=\"brand\" href=\"/\">branchd</a>\
          <a class=\"navlink{wc}\" href=\"/\">workspaces</a>\
-         <a class=\"navlink{sc}\" href=\"/sources\">sources</a></nav>\n",
+         <a class=\"navlink{sc}\" href=\"/sources\">sources</a>\
+         {sync}</nav>\n",
         wc = workspaces_class,
         sc = sources_class,
+        sync = sync_status,
     ));
+}
+
+/// Inline status block for the nav bar: "Last sync: 3m ago" plus a Resync
+/// button. The button is wired up in the page-tail JS to POST `/resync` and
+/// reload on completion.
+fn render_sync_status(snap: &CacheSnapshot) -> String {
+    let label = match snap.last_sync {
+        None => "never synced".to_string(),
+        Some(t) => match SystemTime::now().duration_since(t) {
+            Ok(d) => format!("synced {}", humanize_age(d)),
+            // Clock jumped backwards (e.g. NTP step) — fall back to absolute.
+            Err(_) => "synced just now".to_string(),
+        },
+    };
+    format!(
+        "<span class=\"sync\"><span class=\"sync-time\" title=\"refreshes every 5 min\">{label}</span>\
+         <button class=\"resync\" type=\"button\">Resync</button></span>",
+        label = html_escape(&label),
+    )
+}
+
+fn humanize_age(d: Duration) -> String {
+    let s = d.as_secs();
+    if s < 5 {
+        "just now".to_string()
+    } else if s < 60 {
+        format!("{s}s ago")
+    } else if s < 3600 {
+        format!("{}m ago", s / 60)
+    } else if s < 86400 {
+        format!("{}h ago", s / 3600)
+    } else {
+        format!("{}d ago", s / 86400)
+    }
 }
 
 fn render_workspace(
@@ -706,14 +910,29 @@ fn render_log_line(
         }
         Some(c) => {
             let title = display_title(c);
-            let draft_class = if c.is_draft == Some(true) { " draft" } else { "" };
+            let state_class = match c.pr_state {
+                Some(gh::PrState::Merged) => " merged",
+                Some(gh::PrState::Closed) => " closed",
+                _ if c.is_draft == Some(true) => " draft",
+                _ => "",
+            };
+            let approved_mark = if c.review_decision == Some(gh::ReviewDecision::Approved) {
+                " <span class=\"check\" title=\"approved\">&#10003;</span>"
+            } else {
+                ""
+            };
             let pr_chip = match (&c.pr_url, c.pr_number) {
                 (Some(_), Some(n)) => format!(
-                    " <span class=\"pr{cls}\">#{n}</span>",
-                    cls = draft_class,
+                    " <span class=\"pr{cls}\">#{n}{mark}</span>",
+                    cls = state_class,
                     n = n,
+                    mark = approved_mark,
                 ),
-                (Some(_), None) => format!(" <span class=\"pr{cls}\">PR</span>", cls = draft_class),
+                (Some(_), None) => format!(
+                    " <span class=\"pr{cls}\">PR{mark}</span>",
+                    cls = state_class,
+                    mark = approved_mark,
+                ),
                 _ => String::new(),
             };
             let empty_html = if c.empty {
@@ -833,6 +1052,14 @@ const PAGE_HEAD: &str = r#"<!doctype html>
   nav.top .navlink { color: #888; text-decoration: none; }
   nav.top .navlink.active { color: inherit; font-weight: 600; }
   nav.top .navlink:hover { color: inherit; }
+  nav.top .sync { margin-left: auto; display: inline-flex; align-items: center; gap: .5rem;
+                  font-size: .85em; color: #888; }
+  nav.top .sync-time { font-variant-numeric: tabular-nums; }
+  button.resync { font: inherit; font-size: .85em; padding: .15rem .5rem; cursor: pointer;
+                  border: 1px solid #8884; background: #8881; color: inherit;
+                  border-radius: 4px; }
+  button.resync:hover:not(:disabled) { background: #8882; }
+  button.resync:disabled { cursor: progress; opacity: .7; }
   ul.source-list { list-style: none; padding-left: 1rem; margin: .25rem 0 .75rem; }
   ul.source-list li { padding: .1rem 0; }
   .wschip { display: inline-block; padding: 0 .35rem; margin-left: .25rem;
@@ -859,6 +1086,9 @@ const PAGE_HEAD: &str = r#"<!doctype html>
   .pr { padding: 0 .35rem; margin-left: .35rem; border-radius: 4px;
         background: #2da44e22; color: #2da44e; font-weight: 600; font-size: .9em; }
   .pr.draft { background: #8884; color: #777; }
+  .pr.merged { background: #8250df22; color: #8250df; }
+  .pr.closed { background: #cf222e22; color: #cf222e; }
+  .pr .check { margin-left: .25rem; font-weight: 700; }
   .controls { display: flex; gap: 1rem; align-items: center; margin: 0 0 .75rem;
               font-size: .9em; color: #888; }
   .controls label { cursor: pointer; user-select: none; }
@@ -934,6 +1164,27 @@ const PAGE_TAIL: &str = r#"<script>
     }
     return kept.join("\n\n") + (text.endsWith("\n") ? "\n" : "");
   }
+
+  // Resync button: POST /resync, then reload so the new badge data appears.
+  // Disables the button + swaps label while the request is in flight; multiple
+  // /resync calls serialize server-side via the refresh lock.
+  document.querySelectorAll("button.resync").forEach(function(btn) {
+    btn.addEventListener("click", function() {
+      var orig = btn.textContent;
+      btn.disabled = true;
+      btn.textContent = "Syncing…";
+      fetch("/resync", { method: "POST" })
+        .then(function(r) {
+          if (!r.ok) throw new Error("resync " + r.status);
+          location.reload();
+        })
+        .catch(function(e) {
+          btn.disabled = false;
+          btn.textContent = orig;
+          console.error(e);
+        });
+    });
+  });
 
   document.querySelectorAll("button.copy-md").forEach(function(btn) {
     btn.addEventListener("click", function() {

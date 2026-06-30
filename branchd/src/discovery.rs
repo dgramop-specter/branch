@@ -26,7 +26,6 @@ pub struct RepoDir {
 pub enum RepoKind {
     Jj,
     GitOnly,
-    Other,
 }
 
 #[derive(Debug)]
@@ -34,7 +33,6 @@ pub struct SourceRepo {
     pub namespace: String,
     pub name: String,
     pub path: PathBuf,
-    pub kind: RepoKind,
 }
 
 const MAX_DEPTH: usize = 6;
@@ -67,16 +65,13 @@ pub fn scan_sources(root: &Path) -> Result<Vec<SourceRepo>> {
             if name.starts_with('.') {
                 continue;
             }
-            let kind = if path.join(".jj").exists() {
-                RepoKind::Jj
-            } else {
+            if !path.join(".jj").exists() {
                 continue;
-            };
+            }
             out.push(SourceRepo {
                 namespace: ns_name.clone(),
                 name,
                 path,
-                kind,
             });
         }
     }
