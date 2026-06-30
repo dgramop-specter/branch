@@ -10,9 +10,18 @@
       let
         pkgs = import nixpkgs { inherit system; };
         naersk-lib = pkgs.callPackage naersk { };
+        # Single workspace build produces both `branch` and `branchd` binaries.
+        workspace = naersk-lib.buildPackage {
+          root = ./.;
+        };
       in
       {
-        defaultPackage = naersk-lib.buildPackage ./.;
+        packages = {
+          branch = workspace;
+          branchd = workspace;
+          default = workspace;
+        };
+        defaultPackage = workspace;
         devShell = with pkgs; mkShell {
           buildInputs = [ cargo rustc rustfmt pre-commit rustPackages.clippy ];
           RUST_SRC_PATH = rustPlatform.rustLibSrc;
